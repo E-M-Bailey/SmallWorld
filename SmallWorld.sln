@@ -1,0 +1,25 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 16
+VisualStudioVersion = 16.0.30804.86
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "SmallWorld", "SmallWorld\SmallWorld.vcxproj", "{62392589-3E37-4E09-B3EC-E9361AF85A40}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|x64 = Debug|x64
+		Release|x64 = Release|x64
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{62392589-3E37-4E09-B3EC-E9361AF85A40}.Debug|x64.ActiveCfg = Debug|x64
+		{62392589-3E37-4E09-B3EC-E9361AF85A40}.Debug|x64.Build.0 = Debug|x64
+		{62392589-3E37-4E09-B3EC-E9361AF85A40}.Release|x64.ActiveCfg = Release|x64
+		{62392589-3E37-4E09-B3EC-E9361AF85A40}.Release|x64.Build.0 = Release|x64
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {44A2C2AA-8A3A-45D3-880C-A2F35FFCF101}
+	EndGlobalSection
+EndGlobal

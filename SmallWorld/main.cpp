@@ -362,7 +362,23 @@ int main(int argc, const char* argv[])
 	wcData(argv[1]);
 	//simpleData();
 	//randomData();
-	testWC();
+
+	unsigned long long int ct = 0;
+	//std::vector<unsigned int
+	for (unsigned int i = 0; i < STCT; i++)
+		for (unsigned int j = i + 1; j < STCT; j++)
+		{
+			std::vector<unsigned int> &ia = STADJ[i], &ja = STADJ[j];
+			if (ia == ja)
+			{
+				ct++;
+				i++;
+				j = i + 1;
+			}
+		}
+	std::cout << ct << "/" << STCT;
+
+	//testWC();
 	std::cout << std::endl;
 }
 

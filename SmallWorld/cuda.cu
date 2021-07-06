@@ -5,29 +5,31 @@
 #include <string.h>
 
 #define DO_PROG false
-#define PROG_AMT 100
-
 #define DO_MAXQ false
+#define DO_MAXP false
+#define DO_MEMD false
+
+#define PROG_AMT 100
 
 // Depends on input data, priority queue implementation, and adjacency list orders.
 #if not DO_MAXQ
 #define MAXQ 19430
 #endif
 
-#define DO_MAXP false
-
 #if DO_MAXQ
 #define THCT 512u
 #else
-#define THCT 1024u
+#define THCT 2560u
 #endif
-#define TH_PER_BL 32u
+#define TH_PER_BL 64u
 #define BLCT (THCT / TH_PER_BL)
 
 #define MAX_STCT 22051
 #define MAX_CRSCT 6072
 #define MAX_VCT 28123
 #define MAX_ECT 118314
+
+#define FP_EPSILON 
 
 #ifdef __INTELLISENSE__
 dim3 gridDim;
@@ -45,19 +47,17 @@ typedef Ftype* FList;
 
 typedef unsigned int* Stack;
 
-// A (min-) binary heap is used, as this program works with relatively sparse graphs.
-struct Entry
-{
-	unsigned int idx;
-	Ftype dist;
-};
-typedef Entry* Queue;
+// A (min-) binary heap is used, as this program works with sparse graphs.
+typedef unsigned int* Queue;
 
-__device__ inline void enqueue(unsigned int& size, Queue q, Entry x)
+__device__ inline void enqueue(unsigned int& size, Queue q, unsigned int x, FList d)
 {
 	unsigned int c = size++, p;
 	assert(size <= MAX_ECT);
-	while (c > 0 && x.dist < q[p = (c - 1) / 2].dist)
+	//Ftype xd = d[x.idx];
+	Ftype xd = d[x];
+	//while (c > 0 && x.dist < q[p = (c - 1) / 2].dist)
+	while (c > 0 && xd < d[q[p = (c - 1)]])
 	{
 		q[c] = q[p];
 		c = p;
@@ -65,33 +65,21 @@ __device__ inline void enqueue(unsigned int& size, Queue q, Entry x)
 	q[c] = x;
 }
 
-__device__ inline void enqueue(unsigned int& size, Queue q, unsigned int idx, Ftype dist)
+__device__ inline void dequeue(unsigned int& size, Queue Q, FList D)
 {
-	enqueue(size, q, Entry{ idx, dist });
-}
-
-__device__ inline void dequeue(unsigned int& size, Queue q)
-{
-	unsigned int p = 0, c, l, r;
+	unsigned int p = 0, c, l, r, ql, qr, qc;
+	Ftype dl, dr;
 	assert(size > 0);
-	Entry x = q[--size];
-	while ((l = p * 2 + 1) < size && x.dist > q[c = (r = l + 1) < size && q[l].dist > q[r].dist ? r : l].dist)
+	unsigned int x = Q[--size];
+	Ftype xd = D[x];
+	while ((l = p * 2 + 1) < size && xd > D[Q[c = (r = l + 1) < size && D[Q[l]] > D[Q[r]] ? r : l]])
+	//while ((l = p * 2 + 1) < size && xd > (c = (r = l + 1) < size && (dl = D[ql = Q[l]]) > (dr = D[qr = Q[r]]) ? (qc = qr, dr) : (qc = ql, dl)))
 	{
-		q[p] = q[c];
+		Q[p] = Q[c];
 		p = c;
 	}
-	q[p] = x;
+	Q[p] = x;
 }
-
-//__device__ inline void push(unsigned int& size, Stack s, unsigned int x)
-//{
-//	s[size++] = x;
-//}
-//
-//__device__ inline void pop(unsigned int& size, Stack s)
-//{
-//	size--;
-//}
 
 // Implementation using Brandes' algorithm
 __global__ void kernelBetcA(
@@ -178,16 +166,18 @@ __global__ void kernelBetcA(
 		}
 		Sp[s] = 1.;
 		D[s] = 0.;
-		enqueue(Qs, Q, s, 0.);
+		enqueue(Qs, Q, s, D);
 #if DO_MAXQ
 		if (Qs > maxQ[index]) maxQ[index] = Qs;
 #endif
 		//printf("Reached %d\n", index);
 		while (Qs > 0)
 		{
-			unsigned int v = Q->idx;
-			Ftype dv = Q->dist;
-			dequeue(Qs, Q);
+			//unsigned int v = Q->idx;
+			//Ftype dv = Q->dist;
+			unsigned int v = *Q;
+			Ftype dv = D[v];
+			dequeue(Qs, Q, D);
 			const bool vst = v < stct;
 			S[Ss++] = v;
 			assert(Ss <= MAX_VCT);
@@ -205,11 +195,11 @@ __global__ void kernelBetcA(
 				}
 				if (D[w] < 0)
 				{
-					enqueue(Qs, Q, w, dw);
+					D[w] = dw;
+					enqueue(Qs, Q, w, D);
 #if DO_MAXQ
 					if (Qs > maxQ[index]) maxQ[index] = Qs;
 #endif
-					D[w] = dw;
 				}
 				assert(D[w] <= dw);
 				if (D[w] == dw)
@@ -326,9 +316,9 @@ __host__ void compBetcA(
 	for (unsigned int thid = 0; thid < THCT; thid++)
 	{
 #ifdef MAXQ
-		err = cudaMalloc(queue_d1 + thid, MAXQ * sizeof(Entry));
+		err = cudaMalloc(queue_d1 + thid, MAXQ * sizeof(unsigned int));
 #else
-		err = cudaMalloc(queue_d1 + thid, (ect + 1) * sizeof(Entry));
+		err = cudaMalloc(queue_d1 + thid, (ect + 1) * sizeof(unsigned int));
 #endif
 		assert(!err);
 	}
@@ -433,6 +423,14 @@ __host__ void compBetcA(
 
 	err = cudaDeviceSynchronize();
 	assert(!err);
+
+#if DO_MEMD
+	size_t free, total;
+	err = cudaMemGetInfo(&free, &total);
+	assert(!err);
+	printf("%llu free\n%llu total\n", free, total);
+#endif
+
 	kernelBetcA << <BLCT, TH_PER_BL >> > (
 		stct,
 		crsct,

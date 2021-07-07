@@ -5,6 +5,7 @@
 #include <iomanip>
 #include <iostream>
 #include <numeric>
+#include <queue>
 #include <random>
 #include <stdint.h>
 #include <string>
@@ -13,36 +14,38 @@
 
 #include "types.h"
 
+#define USE_GPU false
+
 template<typename T>
 constexpr T NIL = std::numeric_limits<T>::max();
 
-// Maps students to collapsed vertices
+// Maps students to contracted vertices
 std::vector<v_size_t> STMAP;
-// Number of collapsed student vertices
+// Number of contracted student vertices
 v_size_t STCT;
-// Number of collapsed course vertices
+// Number of contracted course vertices
 v_size_t CRSCT;
-// Number of collapsed vertices
+// Number of contracted vertices
 v_size_t VCT;
-// Number of uncollapsed student vertices
+// Number of uncontracted student vertices
 v_size_t USTCT;
-// Number of uncollapsed vertices
+// Number of uncontracted vertices
 v_size_t UVCT;
 
-// Adjacency structure of collapsed graph
+// Adjacency structure of contracted graph
 std::vector<std::vector<v_size_t>> ADJ;
-// Number of students/courses mapping to each collapsed vertex
+// Number of students/courses mapping to each contracted vertex
 // TODO maybe decrease to 1 byte per vertex
 std::vector<v_size_t> MULT;
 // Number of students in each course.
 std::vector<v_size_t> CRSDEGS;
-// Student type (0 for courses) of each collapsed vertex
+// Student type (0 for courses) of each contracted vertex
 std::vector<v_type_t> TYPES;
-// Vertex weight (0 for students) of each collapsed vertex
+// Vertex weight (0 for students) of each contracted vertex
 std::vector<weight_t> WEIGHTS;
 // Cost for each course
 std::vector<cost_t> COSTS;
-// Whether each collapsed vertex has not been removed
+// Whether each contracted vertex has not been removed
 // True for students with at least 1 remaining course, false for other students after a call to incl.
 std::vector<bool> MASK;
 
@@ -52,11 +55,15 @@ std::vector<std::vector<v_size_t>> CCS;
 std::vector<v_size_t> CCSIZES;
 
 // Biconnected components of the graph in order of nondescending numbers of students.
-// Note that biconnectivity is defined in terms of the uncollapsed graph.
-// Vertices are pairs containing their collapsed index and an identifier unique to other vertices that collapse the same vertex.
+// Note that biconnectivity is defined in terms of the uncontracted graph.
+// Vertices are pairs containing their contracted index and an identifier unique to other vertices that contract to the same vertex.
 std::vector<std::vector<std::pair<v_size_t, v_size_t>>> BCCS;
 // Number of students in each biconnected component in nondescending order.
 std::vector<v_size_t> BCCSIZES;
+
+// Betweenness centrality of each node accounting for multiplicities.
+std::vector<weight_t> BC;
+
 
 template<typename T>
 inline std::vector<T> mkIota(T size, T val = 0)
@@ -522,6 +529,93 @@ v_size_t bcc()
 //	return ret;
 //}
 
+#if USE_GPU
+
+#else
+// N == 0: No normalization
+// N == 1: (n-2)(n-1)/2 normalization
+// N == 2: n(n-1)/2 normalization
+template<v_type_t N>
+inline weight_t bc(const std::vector<bool>& SRC)
+{
+	static_assert(N < 3);
+	BC = std::vector<weight_t>(VCT, 0);
+	std::vector<v_size_t> S;
+	std::vector<std::vector<v_size_t>> P(VCT);
+	std::vector<weight_t> SP(VCT);
+	std::vector<weight_t> D(VCT);
+	std::vector<weight_t> DEP(VCT);
+	typedef idx_cmp<weight_t, std::greater<weight_t>> Pred;
+	std::priority_queue<v_size_t, std::vector<v_size_t>, Pred> Q((Pred(D)));
+	v_size_t n = 0;
+	for (v_size_t s = 0; s < VCT; s++)
+	{
+		if (s == 0 || (s - 1) * 100 / VCT < s * 100 / VCT) std::cout << '\r' << s * 100 / VCT << '%' << std::flush;
+		if (!MASK[s] || !SRC[s]) continue;
+		assert(MULT[s]);
+		n += MULT[s];
+		assert(S.empty());
+		std::fill(P.begin(), P.end(), std::vector<v_size_t>());
+		std::fill(SP.begin(), SP.end(), 0);
+		SP[s] = 1;
+		std::fill(D.begin(), D.end(), -1);
+		D[s] = 0;
+		std::fill(DEP.begin(), DEP.end(), 0);
+		assert(Q.empty());
+		Q.push(s);
+		while (!Q.empty())
+		{
+			v_size_t v = Q.top();
+			Q.pop();
+			S.push_back(v);
+			weight_t dv = D[v] + WEIGHTS[v];
+			for (v_size_t w : ADJ[v])
+			{
+				if (!MASK[w]) continue;
+				weight_t dw = dv + WEIGHTS[w];
+				if (D[w] < 0)
+				{
+					D[w] = dw;
+					Q.push(w);
+				}
+				if (D[w] == dw)
+				{
+					SP[w] += SP[v] * MULT[v];
+					P[w].push_back(v);
+				}
+			}
+		}
+		while (!S.empty())
+		{
+			v_size_t w = S.back();
+			S.pop_back();
+			assert(SP[w]);
+			if (SP[w] == 0)
+			{
+				std::cout << "STOP " << s << ' ' << w << ' ' << P[w].size();
+				for (v_size_t p : P[w]) std::cout << ' ' << p << ' ' << SP[p];
+				std::cout << std::endl;
+			}
+			for (v_size_t v : P[w])
+				DEP[v] += static_cast<weight_t>(SP[v]) / SP[w] * (SRC[w] + DEP[w]);
+			if (w != s)
+				BC[w] += DEP[w];
+		}
+	}
+	std::cout << '\r' << std::flush;
+	weight_t maxBC = 0;
+	weight_t f =
+		N == 0 ? static_cast<weight_t>(1) :
+		N == 1 ? static_cast<weight_t>(2) / ((n - 2) * (n - 1)) :
+		static_cast<weight_t>(2) / (n * (n - 1));
+	std::cout << "f=" << f << ",n=" << n << std::endl;
+	for (v_size_t s = 0; s < VCT; s++)
+		if (MASK[s])
+			maxBC = std::max(maxBC, BC[s] *= f / MULT[s]);
+	return maxBC;
+}
+#endif
+
 template<unsigned int P, unsigned int W, bool I>
 struct Format {};
 template<unsigned int P, unsigned int W, bool I>
@@ -544,16 +638,17 @@ void analyze(unsigned int tc)
 	v_size_t inclSt = incl();
 	v_size_t maxCC = cc();
 	v_size_t maxBCC = bcc();
-	Time start = Clock::now();
 	//Ftype betc = betca<true>();
+	Time start = Clock::now();
+	weight_t maxBC = bc<1>(std::vector<bool>(VCT, true));
 	Time end = Clock::now();
-	//std::cout << duration_cast<seconds>(end - start).count() << " seconds" << std::endl;
+	std::cout << duration_cast<seconds>(end - start).count() << " seconds" << std::endl;
 	weight_t inclStd = inclSt * f;
 	weight_t maxCCd = maxCC * f;
 	weight_t maxBCCd = maxBCC * f;
 
-	//std::cout << ifmt << tc << fmt << inclStd << fmt << maxCCd << fmt << maxBCCd << bfmt << betc << std::endl;
-	std::cout << ifmt << tc << fmt << inclStd << fmt << maxCCd << fmt << maxBCCd << bfmt << std::endl;
+	std::cout << ifmt << tc << fmt << inclStd << fmt << maxCCd << fmt << maxBCCd << bfmt << maxBC << std::endl;
+	//std::cout << ifmt << tc << fmt << inclStd << fmt << maxCCd << fmt << maxBCCd << bfmt << std::endl;
 }
 
 void testWC()

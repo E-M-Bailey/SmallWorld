@@ -4,6 +4,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "types.h"
+
 #define DO_PROG false
 #define DO_MAXQ false
 #define DO_MAXP false
@@ -52,33 +54,33 @@ typedef unsigned int* Queue;
 
 __device__ inline void enqueue(unsigned int& size, Queue q, unsigned int x, FList d)
 {
-	unsigned int c = size++, p;
+	unsigned int c = size++, P;
 	assert(size <= MAX_ECT);
 	//Ftype xd = d[x.idx];
 	Ftype xd = d[x];
 	//while (c > 0 && x.dist < q[p = (c - 1) / 2].dist)
-	while (c > 0 && xd < d[q[p = (c - 1)]])
+	while (c > 0 && xd < d[q[P = (c - 1)]])
 	{
-		q[c] = q[p];
-		c = p;
+		q[c] = q[P];
+		c = P;
 	}
 	q[c] = x;
 }
 
 __device__ inline void dequeue(unsigned int& size, Queue Q, FList D)
 {
-	unsigned int p = 0, c, l, r, ql, qr, qc;
+	unsigned int P = 0, c, l, r, ql, qr, qc;
 	Ftype dl, dr;
 	assert(size > 0);
 	unsigned int x = Q[--size];
 	Ftype xd = D[x];
-	while ((l = p * 2 + 1) < size && xd > D[Q[c = (r = l + 1) < size && D[Q[l]] > D[Q[r]] ? r : l]])
+	while ((l = P * 2 + 1) < size && xd > D[Q[c = (r = l + 1) < size && D[Q[l]] > D[Q[r]] ? r : l]])
 	//while ((l = p * 2 + 1) < size && xd > (c = (r = l + 1) < size && (dl = D[ql = Q[l]]) > (dr = D[qr = Q[r]]) ? (qc = qr, dr) : (qc = ql, dl)))
 	{
-		Q[p] = Q[c];
-		p = c;
+		Q[P] = Q[c];
+		P = c;
 	}
-	Q[p] = x;
+	Q[P] = x;
 }
 
 // Implementation using Brandes' algorithm

@@ -11,13 +11,16 @@
     </ProjectConfiguration>
   </ItemGroup>
   <ItemGroup>
-    <None Include="Weeden_Cornwell_ANSI.csv" />
-  </ItemGroup>
-  <ItemGroup>
-    <CudaCompile Include="cuda.cu" />
+    <CudaCompile Include="gpu-impl.cu" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="main.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="types.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <Text Include="Cornell.txt" />
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <ProjectGuid>{62392589-3E37-4E09-B3EC-E9361AF85A40}</ProjectGuid>

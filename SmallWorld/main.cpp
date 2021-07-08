@@ -1,9 +1,11 @@
 #include <algorithm>
 #include <assert.h>
+#include <atomic>
 #include <chrono>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <numeric>
 #include <queue>
 #include <random>
@@ -47,7 +49,7 @@ std::vector<weight_t> WEIGHTS;
 std::vector<cost_t> COSTS;
 // Whether each contracted vertex has not been removed
 // True for students with at least 1 remaining course, false for other students after a call to incl.
-std::vector<bool> MASK;
+std::vector<mask_t> MASK;
 
 // Connected components of the graph in order of nondescending numbers of students.
 std::vector<std::vector<v_size_t>> CCS;
@@ -239,17 +241,18 @@ void wcData(const char* location)
 	{
 		v_size_t p = stp[stidp - 1], c = stp[stidp];
 		STMAP[c] = STCT += sttp[p] != sttp[c] || stadj[p] != stadj[c];
+		//STMAP[c] = STCT += 1;
 	}
-	VCT = STCT + CRSCT;
+	VCT = ++STCT + CRSCT;
 
 	ADJ = std::vector<std::vector<v_size_t>>(VCT);
 	MULT = std::vector<v_size_t>(VCT, 0);
 	TYPES = std::vector<v_type_t>(VCT, 0);
 	WEIGHTS = std::vector<weight_t>(VCT, 0);
-	MASK = std::vector<bool>(VCT, true);
+	MASK = std::vector<mask_t>(VCT, true);
 
 	std::vector<v_size_t> crsdeg(CRSCT, 0);
-	std::vector<bool> repeat(USTCT, 0);
+	std::vector<mask_t> repeat(USTCT, 0);
 
 	for (v_size_t stid = 0; stid < USTCT; stid++)
 	{
@@ -288,7 +291,50 @@ void wcData(const char* location)
 	}
 }
 
-void simpleData()
+void uncontractedData()
+{
+	STMAP = { 0, 1, 2 };
+	STCT = 3;
+	CRSCT = 2;
+	VCT = 5;
+	USTCT = 3;
+	UVCT = 5;
+	ADJ.resize(5);
+	ADJ[0] = { 3, 4 };
+	ADJ[1] = { 3 };
+	ADJ[2] = { 3, 4 };
+	ADJ[3] = { 0, 1, 2 };
+	ADJ[4] = { 0, 2 };
+	MULT = { 1, 1, 1, 1, 1 };
+	CRSDEGS = { 3, 2 };
+	TYPES = { 2, 5, 2, 0, 0 };
+	WEIGHTS = { 0, 0, 0, 1, 1 };
+	COSTS = { 3, 2 };
+	MASK = { true, true, true, true, true };
+}
+
+void unweightedData()
+{
+	STMAP = { 0, 1, 0 };
+	STCT = 2;
+	CRSCT = 2;
+	VCT = 4;
+	USTCT = 3;
+	UVCT = 5;
+	ADJ.resize(4);
+	ADJ[0] = { 2, 3 };
+	ADJ[1] = { 2 };
+	ADJ[2] = { 0, 1 };
+	ADJ[3] = { 0 };
+	MULT = { 2, 1, 1, 1 };
+	CRSDEGS = { 3, 2 };
+	TYPES = { 2, 5, 0, 0 };
+	WEIGHTS = { 0, 0, 1, 1 };
+	COSTS = { 3, 2 };
+	MASK = { true, true, true, true };
+}
+
+void weightedData()
 {
 	STMAP = { 0, 1, 0 };
 	STCT = 2;
@@ -531,87 +577,172 @@ v_size_t bcc()
 
 #if USE_GPU
 
+static_assert(false, "GPU not yet supported.");
+
 #else
+
+#define NUM_THREADS 12
+
 // N == 0: No normalization
 // N == 1: (n-2)(n-1)/2 normalization
 // N == 2: n(n-1)/2 normalization
+
 template<v_type_t N>
-inline weight_t bc(const std::vector<bool>& SRC)
+inline weight_t bc(std::vector<mask_t> SRC)
 {
 	static_assert(N < 3);
 	BC = std::vector<weight_t>(VCT, 0);
-	std::vector<v_size_t> S;
-	std::vector<std::vector<v_size_t>> P(VCT);
-	std::vector<weight_t> SP(VCT);
-	std::vector<weight_t> D(VCT);
-	std::vector<weight_t> DEP(VCT);
-	typedef idx_cmp<weight_t, std::greater<weight_t>> Pred;
-	std::priority_queue<v_size_t, std::vector<v_size_t>, Pred> Q((Pred(D)));
-	v_size_t n = 0;
-	for (v_size_t s = 0; s < VCT; s++)
+	std::atomic<v_size_t> bcS = 0;
+	std::mutex bcMutex;
+	//e_size_t maxQ = 0;
+	//for (v_size_t v = 0; v < VCT; v++)
+	//	if (MASK[v])
+	//		for (v_size_t w : ADJ[v])
+	//			if (MASK[w])
+	//				maxQ++;
+	e_size_t maxQ = 50000;
+	maxQ = maxQ / 2 + 1;
+	for (v_size_t i = 0; i < VCT; i++) SRC[i] &= MASK[i];
+	const auto perThread = [&bcS, &bcMutex, &SRC, maxQ]() -> void
 	{
-		if (s == 0 || (s - 1) * 100 / VCT < s * 100 / VCT) std::cout << '\r' << s * 100 / VCT << '%' << std::flush;
-		if (!MASK[s] || !SRC[s]) continue;
-		assert(MULT[s]);
-		n += MULT[s];
-		assert(S.empty());
-		std::fill(P.begin(), P.end(), std::vector<v_size_t>());
-		std::fill(SP.begin(), SP.end(), 0);
-		SP[s] = 1;
-		std::fill(D.begin(), D.end(), -1);
-		D[s] = 0;
-		std::fill(DEP.begin(), DEP.end(), 0);
-		assert(Q.empty());
-		Q.push(s);
-		while (!Q.empty())
+		std::vector<weight_t> threadBC(VCT, 0);
+		std::vector<v_size_t> S;
+		std::vector<v_size_t*> P(VCT);
+		for (v_size_t i = 0; i < VCT; i++)
+			if (MASK[i])
+				P[i] = new v_size_t[ADJ[i].size()];
+		std::vector<v_size_t> Ps(VCT, 0);
+		std::vector<weight_t> SP(VCT);
+		std::vector<weight_t> D(VCT);
+		std::vector<weight_t> DEP(VCT);
+		typedef std::pair<weight_t, v_size_t> Entry;
+		//typedef idx_cmp<weight_t, std::greater<weight_t>> Pred;
+		//std::priority_queue<Entry, std::vector<Entry>, std::greater<Entry>> Q;
+		//std::priority_queue<v_size_t, std::vector<v_size_t>, Pred> Q((Pred(D)));
+		std::vector<Entry> Q(maxQ);
+		e_size_t Qs = 0;
+		v_size_t s;
+		for (s = bcS++; s < VCT; s = bcS++)
 		{
-			v_size_t v = Q.top();
-			Q.pop();
-			S.push_back(v);
-			weight_t dv = D[v] + WEIGHTS[v];
+			if (s == 0 || (s - 1) * 100 / VCT < s * 100 / VCT) std::cout << '\r' << s * 100 / VCT << '%' << std::flush;
+			if (!MASK[s] || !SRC[s]) continue;
+			assert(MULT[s]);
+			assert(S.empty());
+			std::fill(Ps.begin(), Ps.end(), 0);
+			//std::fill(P.begin(), P.end(), std::vector<v_size_t>());
+			std::fill(SP.begin(), SP.end(), 0);
+			SP[s] = MULT[s];
+			std::fill(D.begin(), D.end(), -1);
+			D[s] = 0;
+			std::fill(DEP.begin(), DEP.end(), 0);
+			assert(Qs == 0);
+			Q[Qs++] = { 0, s };
+			while (Qs)
+			{
+				v_size_t v = Q[0].second;
+				e_size_t p = 0, c, l, r;
+				Entry x = Q[--Qs], ql, qr, qc;
+				for (; (l = p * 2 + 1) < Qs; p = c)
+				{
+					ql = Q[l];
+					r = l + 1;
+					bool goR = r < Qs && (qr = Q[r]).first < ql.first;
+					c = goR ? r : l;
+					qc = goR ? qr : ql;
+					if (qc.first >= x.first) break;
+					Q[p] = qc;
+				}
+				Q[p] = x;
+				S.push_back(v);
+				weight_t dv = D[v] + WEIGHTS[v];
+				for (v_size_t w : ADJ[v])
+				{
+					if (!MASK[w]) continue;
+					weight_t dw = dv + WEIGHTS[w];
+					if (D[w] < 0)
+					{
+						for (c = Qs++; c > 0 && dw < Q[p = (c - 1) / 2].first; c = p)
+							Q[c] = Q[p];
+						Q[c] = { dw, w };
+						D[w] = dw;
+					}
+					if (D[w] == dw)
+					{
+						SP[w] += SP[v] * MULT[w];
+						P[w][Ps[w]++] = v;
+					}
+				}
+			}
+			std::cout << "";
+			while (!S.empty())
+			{
+				v_size_t w = S.back();
+				S.pop_back();
+				weight_t f = (SRC[w] ? MULT[w] + DEP[w] : DEP[w]) * MULT[w] / SP[w];
+				for (v_size_t i = 0, v; i < Ps[w]; i++)
+					v = P[w][i], DEP[v] += SP[v] * f;
+				if (w != s)
+					threadBC[w] += DEP[w] * MULT[s];
+			}
+			std::cout << "";
+		}
+		if (s == VCT)
+			std::cout << '\r' << std::flush;
+		bcMutex.lock();
+		for (v_size_t i = 0; i < VCT; i++)
+			if (MASK[i])
+				BC[i] += threadBC[i] / MULT[i];
+		bcMutex.unlock();
+		for (v_size_t i = 0; i < VCT; i++)
+			if (MASK[i])
+				delete[] P[i];
+	};
+
+	// Add paths between structurally equivalent pairs of vertices
+	for (v_size_t v = 0; v < VCT; v++)
+		if (SRC[v] && MULT[v] > 1)
+		{
+			e_size_t n = MULT[v];
+			n = n * (n - 1);
+			v_size_t d = 0;
+			weight_t minWt = std::numeric_limits<weight_t>::infinity();
 			for (v_size_t w : ADJ[v])
 			{
 				if (!MASK[w]) continue;
-				weight_t dw = dv + WEIGHTS[w];
-				if (D[w] < 0)
+				weight_t wt = WEIGHTS[w];
+				if (wt < minWt)
 				{
-					D[w] = dw;
-					Q.push(w);
+					d = MULT[w];
+					minWt = wt;
 				}
-				if (D[w] == dw)
-				{
-					SP[w] += SP[v] * MULT[v];
-					P[w].push_back(v);
-				}
+				else if (wt == minWt)
+					d += MULT[w];
 			}
+			weight_t dbc = static_cast<weight_t>(n) / d;
+			for (v_size_t w : ADJ[v])
+				if (MASK[w] && WEIGHTS[w] == minWt) BC[w] += dbc;
 		}
-		while (!S.empty())
-		{
-			v_size_t w = S.back();
-			S.pop_back();
-			assert(SP[w]);
-			if (SP[w] == 0)
-			{
-				std::cout << "STOP " << s << ' ' << w << ' ' << P[w].size();
-				for (v_size_t p : P[w]) std::cout << ' ' << p << ' ' << SP[p];
-				std::cout << std::endl;
-			}
-			for (v_size_t v : P[w])
-				DEP[v] += static_cast<weight_t>(SP[v]) / SP[w] * (SRC[w] + DEP[w]);
-			if (w != s)
-				BC[w] += DEP[w];
-		}
-	}
-	std::cout << '\r' << std::flush;
+
+	std::vector<std::thread> threads;
+	for (v_size_t th = 0; th < NUM_THREADS; th++)
+		threads.emplace_back(perThread);
+	for (std::thread& thread : threads)
+		thread.join();
+	//perThread();
+
+	v_size_t n = 0;
+	for (v_size_t v = 0; v < VCT; v++)
+		if (MASK[v]) n += MULT[v];
+
 	weight_t maxBC = 0;
 	weight_t f =
-		N == 0 ? static_cast<weight_t>(1) :
-		N == 1 ? static_cast<weight_t>(2) / ((n - 2) * (n - 1)) :
-		static_cast<weight_t>(2) / (n * (n - 1));
-	std::cout << "f=" << f << ",n=" << n << std::endl;
-	for (v_size_t s = 0; s < VCT; s++)
-		if (MASK[s])
-			maxBC = std::max(maxBC, BC[s] *= f / MULT[s]);
+		N == 0 ? 0.5 :
+		N == 1 ? 1 / (static_cast<weight_t>(n - 2) * (n - 1)) :
+		1 / (static_cast<weight_t>(n) * (n - 1));
+	//std::cout << "f=" << f << ",n=" << n << std::endl;
+	for (v_size_t v = 0; v < VCT; v++)
+		if (MASK[v])
+			maxBC = std::max(maxBC, BC[v] *= f);
 	return maxBC;
 }
 #endif
@@ -640,7 +771,10 @@ void analyze(unsigned int tc)
 	v_size_t maxBCC = bcc();
 	//Ftype betc = betca<true>();
 	Time start = Clock::now();
-	weight_t maxBC = bc<1>(std::vector<bool>(VCT, true));
+	std::vector<mask_t> src(VCT, false);
+	for (v_size_t v : CCS.back())
+		src[v] = true;
+	weight_t maxBC = bc<1>(src);
 	Time end = Clock::now();
 	std::cout << duration_cast<seconds>(end - start).count() << " seconds" << std::endl;
 	weight_t inclStd = inclSt * f;
@@ -676,8 +810,11 @@ void testWC()
 int main(int argc, const char* argv[])
 {
 	wcData(argv[1]);
-	//simpleData();
+	//uncontractedData();
+	//unweightedData();
+	//weightedData();
 	//randomData();
+	//DATA_SRC();
 
 	//unsigned long long int ct = 0;
 	//auto start = std::chrono::high_resolution_clock::now();

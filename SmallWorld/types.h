@@ -20,4 +20,7 @@ typedef unsigned int cost_t;
 // Vertex weight
 typedef float weight_t;
 
+// Type used in masks (not necessarily bool to avoid the slower std::vector<bool>)
+typedef unsigned char mask_t;
+
 #endif

@@ -59,7 +59,7 @@ __device__ inline void enqueue(unsigned int& size, Queue q, unsigned int x, FLis
 	//Ftype xd = d[x.idx];
 	Ftype xd = d[x];
 	//while (c > 0 && x.dist < q[p = (c - 1) / 2].dist)
-	while (c > 0 && xd < d[q[P = (c - 1)]])
+	while (c > 0 && xd < d[q[P = (c - 1) / 2]])
 	{
 		q[c] = q[P];
 		c = P;

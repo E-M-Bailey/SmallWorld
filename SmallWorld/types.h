@@ -23,4 +23,7 @@ typedef float weight_t;
 // Type used in masks (not necessarily bool to avoid the slower std::vector<bool>)
 typedef unsigned char mask_t;
 
+// Type used in numbers present in input files
+typedef unsigned int input_t;
+
 #endif

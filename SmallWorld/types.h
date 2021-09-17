@@ -4,7 +4,7 @@
 #include <limits>
 
 // Change n_type_t if more than 2^7-1 majors are required.
-// Change n_size_t if more than 2^16-1 vertices are required.
+// Change v_size_t if more than 2^16-1 vertices are required.
 // Change e_size_t if more than 2^32-1 edges are required.
 
 // Vertex type

@@ -1,7 +1,36 @@
+/*
+* A replication of some of the computations from Weeden and Cornwell's paper
+* Written by Evan Bailey
+*
+* NOTE: This program does give the correct result for Cornell's University dataset. However, the code is fairly messy, it would be difficult to
+*       adapt to a non-bipartite graph, and some performance improvements are likely still possible. I am currently working on another version to
+*       address these issues.
+*
+* Input Format (file name passed as first parameter in stdin)
+* Line 1: The string "WC" (without quotes)
+* Line 2: Two space-separated integers: the number of students and the number of courses
+* Onward: Five space-separated integers per line: the student id, the course id, the student's major (in [1, 6]),
+*         a 1 for grads and a 0 for undergrads, and the course hours (always 1 for the Cornell dataset).
+*
+* Output format (excluding timing messages):
+* Lines 1-2 are blank.
+* Line 3: The string "UNIVERSITY"
+* Then, several pairs of lines follow, each corresponding to a different threshold of total section cost removed. For each iteration:
+* Line 1: The runtime of the betweenness centrality procedure (this can be disabled by setting the macro TIME_BC to false)
+* Line 2: Four integers and one decimal: The total cost of removed sections, the number of included students, the largest component's size, the
+*                                        largest biconnected component's size, and the maximum normalized betweenness centrality of any vertex.
+* 
+* Note: If the PERCENT macro is set to true, percentages will be output for included students, component size, and biconnected component size.
+* 
+* The total costs used were selected to correspond to the same groups of removed sections used in Weeden and Cornwell's paper.
+* 
+* On my machine, compiled by MSVC with /O2 enabled and NUM_THREADS set to 12, the first betweenness centrality iteration usually takes 12-15 seconds
+* and the last iteration usually takes around 7-8 seconds.
+*/
+
 #include <algorithm>
 #include <assert.h>
 #include <atomic>
-#include <bitset>
 #include <chrono>
 #include <fstream>
 #include <iomanip>
@@ -12,757 +41,955 @@
 #include <random>
 #include <stdint.h>
 #include <string>
-#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "types.h"
+
+#define USE_GPU false
 
 #define DO_BC true
 #define TIME_BC true
 #define DO_BC_PROG true
 #define NUM_THREADS 12
+#define PERCENT true
+
+//template<typename T>
+//constexpr T MAX = std::numeric_limits<T>::max();
+
+// Maps students to contracted vertices
+std::vector<v_size_t> STMAP;
+// Number of contracted student vertices
+v_size_t STCT;
+// Number of contracted course vertices
+v_size_t CRSCT;
+// Number of contracted vertices
+v_size_t VCT;
+// Number of uncontracted student vertices
+v_size_t USTCT;
+// Number of uncontracted vertices
+v_size_t UVCT;
+
+// Adjacency structure of contracted graph
+std::vector<std::vector<v_size_t>> ADJ;
+// Number of students/courses mapping to each contracted vertex
+// TODO maybe decrease to 1 byte per vertex
+std::vector<v_size_t> MULT;
+// Number of students in each course.
+std::vector<v_size_t> CRSDEGS;
+// Student type (0 for courses) of one student of each contracted vertex
+std::vector<v_type_t> TYPES;
+// Vertex weight (0 for students) of each contracted vertex
+std::vector<weight_t> WEIGHTS;
+// Cost for each course
+std::vector<cost_t> COSTS;
+// Whether each contracted vertex has not been removed
+// True for students with at least 1 remaining course, false for other students after a call to incl.
+std::vector<mask_t> MASK;
+
+// Connected components of the graph in order of nondescending numbers of students.
+std::vector<std::vector<v_size_t>> CCS;
+// Number of students in each connected component in nondescending order.
+std::vector<v_size_t> CCSIZES;
+
+// Biconnected components of the graph in order of nondescending numbers of students.
+// Note that biconnectivity is defined in terms of the uncontracted graph.
+// Vertices are pairs containing their contracted index and an identifier unique to other vertices that contract to the same vertex.
+std::vector<std::vector<std::pair<v_size_t, v_size_t>>> BCCS;
+// Number of students in each biconnected component in nondescending order.
+std::vector<v_size_t> BCCSIZES;
+
+// Betweenness centrality of each node accounting for multiplicities.
+std::vector<weight_t> BC;
 
 template<typename T>
-constexpr T MAX = std::numeric_limits<T>::max();
-template<typename T>
-constexpr T INF = std::numeric_limits<T>::infinity();
-
-// Returns the number of elements v of vec such that mask[v] is true.
-inline v_size_t maskedCount(const std::vector<v_size_t>& vec, const std::vector<mask_t>& mask)
+inline std::vector<T> mkIota(T size, T val = 0)
 {
-	v_size_t count = 0;
-	for (v_size_t v : vec)
-		count += mask[v];
-	return count;
+	std::vector<T>iota(size);
+	std::iota(iota.begin(), iota.end(), val);
+	return iota;
 }
 
-// Returns a pair of the largest masked size in vecs and its first index.
-inline std::pair<v_size_t, v_size_t> maxMaskedCount(const std::vector<std::vector<v_size_t>>& vecs, const std::vector<mask_t> mask)
+template<typename T, typename Pred = std::less<T>>
+inline std::vector<T> mkPerm(T size, Pred pred = Pred())
 {
-	if (vecs.empty()) return { MAX<v_size_t>, MAX<v_size_t> };
-	v_size_t maxIdx = 0, maxSize = maskedCount(vecs[0], mask);
-	for (v_size_t i = 1; i < vecs.size(); i++)
-	{
-		v_size_t size = maskedCount(vecs[i], mask);
-		if (size > maxSize)
-		{
-			maxIdx = i;
-			maxSize = size;
-		}
-	}
-	return { maxSize, maxIdx };
+	std::vector<T> perm = mkIota(size);
+	std::sort(perm.begin(), perm.end(), pred);
+	return perm;
 }
 
-// Masked-out vertices have a value of 0 in the returned vector.
-inline std::vector<v_size_t> degrees(const std::vector<std::vector<v_size_t>>& adj, const std::vector<mask_t>& mask)
+template<typename T, typename Pred = std::less<T>>
+inline std::vector<T> mkPerm(T size, T val, Pred pred = Pred())
 {
-	v_size_t vct = static_cast<v_size_t>(adj.size());
-	std::vector<v_size_t> deg(vct, 0);
-	for (v_size_t v = 0; v < vct; v++)
-		if (mask[v])
-			for (v_size_t w : adj[v])
-				deg[v] += mask[w];
-	return deg;
+	std::vector<T> perm = mkIota(size, val);
+	std::sort(perm.begin(), perm.end(), pred);
+	return perm;
 }
 
-// Returns all vertices with a nonzero degree.
-inline std::vector<v_size_t> non0degrees(const std::vector<std::vector<v_size_t>>& adj, const std::vector<mask_t>& mask)
+template<typename T, typename Pred = std::less<T>>
+struct idx_cmp
 {
-	v_size_t vct = static_cast<v_size_t>(adj.size());
-	std::vector<v_size_t> degs = degrees(adj, mask);
-	std::vector<v_size_t> non0;
-	non0.reserve(vct);
-	for (v_size_t v = 0; v < vct; v++)
-		if (degs[v])
-			non0.push_back(v);
-	return non0;
-}
+private:
+	const std::vector<T>& vec;
+	const Pred pred;
 
-//struct DFSData
-//{
-//	const std::vector<std::vector<v_size_t>>& adj;
-//	const std::vector<mask_t>& mask;
-//};
-
-// visitStart and visitEnd are passed u and v.
-// isVisited is passed the vertex in question.
-// visitPreRecursion, visitPostRecursion, and visitAgain are passed u, v, and w.
-// u == v iff this iteration is the first in its connected component.
-// All methods have void return type except isVisited, which returns a bool corresponding to whether a vertex is already visited.
-template<typename VisitStart, typename VisitEnd, typename IsVisited, typename VisitPreRecursion, typename VisitPostRecursion, typename VisitAgain>
-class DFS
-{
 public:
-	const VisitStart& visitStart;
-	const VisitEnd& visitEnd;
-	const IsVisited& isVisited;
-	const VisitPreRecursion& visitPreRecursion;
-	const VisitPostRecursion& visitPostRecursion;
-	const VisitAgain& visitAgain;
-
-
-	inline DFS(const VisitStart& visitStart, const VisitEnd& visitEnd, const IsVisited& isVisited, const VisitPreRecursion& visitPreRecursion, const VisitPostRecursion& visitPostRecursion, const VisitAgain& visitAgain) :
-		visitStart(visitStart),
-		visitEnd(visitEnd),
-		isVisited(isVisited),
-		visitPreRecursion(visitPreRecursion),
-		visitPostRecursion(visitPostRecursion),
-		visitAgain(visitAgain)
+	inline idx_cmp(const std::vector<T>& vec, const Pred& pred = Pred()) :
+		vec(vec),
+		pred(pred)
 	{}
 
-private:
-	inline void recurse(const std::vector<std::vector<v_size_t>>& adj, const std::vector<mask_t>& mask, v_size_t u, v_size_t v)
+	template<typename U>
+	inline bool operator()(U l, U r) const
 	{
-		visitStart(u, v);
-		for (v_size_t w : adj[v])
-		{
-			if (!mask[w]) continue;
-
-			if (isVisited(w))
-				visitAgain(u, v, w);
-			else
-			{
-				visitPreRecursion(u, v, w);
-				// Stack overflow is possible here if the stack size is too small.
-				recurse(adj, mask, v, w);
-				visitPostRecursion(u, v, w);
-			}
-		}
-		visitEnd(u, v);
-	}
-
-public:
-	inline void operator()(const std::vector<std::vector<v_size_t>>& adj, const std::vector<mask_t>& mask)
-	{
-		v_size_t vct = adj.size();
-		for (v_size_t s = 0; s < vct; s++)
-			if (mask[s] && !isVisited(s))
-				recurse(adj, mask, s, s);
+		return pred(vec[l], vec[r]);
 	}
 };
 
-// Returns the connected components
-inline std::vector<std::vector<v_size_t>> components(const std::vector<std::vector<v_size_t>>& adj, const std::vector<mask_t>& mask)
+template<typename T, typename Pred = std::less<T>>
+struct pair_lex_cmp
 {
-	v_size_t vct = static_cast<v_size_t>(adj.size());
-	std::vector<mask_t> visited(vct, false);
-	std::vector<std::vector<v_size_t>> comps;
+private:
+	const Pred pred;
 
-	const auto visitStart = [&visited, &comps](v_size_t u, v_size_t v) -> void
+public:
+	inline pair_lex_cmp(const Pred& pred = Pred()) :
+		pred(pred)
+	{}
+
+	inline bool operator()(const std::pair<T, T>& l, const std::pair<T, T>& r) const
 	{
-		visited[v] = true;
-		if (u == v)
-			comps.emplace_back();
-		comps.back().push_back(v);
-	};
+		return pred(l.first, r.first) || l.first == r.first && pred(l.second, r.second);
+	}
+};
 
-	const auto visitEnd = [](v_size_t u, v_size_t v) -> void {};
+template<typename T = size_t, typename Pred = std::less<T>>
+struct size_cmp
+{
+private:
+	const Pred pred;
 
-	const auto isVisited = [&visited](v_size_t v) -> bool
+public:
+	inline size_cmp(const Pred& pred = Pred()) :
+		pred(pred)
+	{}
+
+	template<typename U>
+	inline bool operator()(const U& l, const U& r) const
 	{
-		return visited[v];
-	};
+		return pred(l.size(), r.size());
+	}
+};
 
-	const auto visitPreRecursion = [](v_size_t u, v_size_t v, v_size_t w) -> void {};
+template<typename T, typename U>
+struct std::hash<std::pair<T, U>>
+{
+	inline constexpr size_t operator()(const std::pair<T, U>& val) const noexcept
+	{
+		return std::hash<T>()(val.first) ^ std::hash<U>()(val.second);
+	}
+};
 
-	const auto visitPostRecursion = [](v_size_t u, v_size_t v, v_size_t w) -> void {};
-
-	const auto visitAgain = [](v_size_t u, v_size_t v, v_size_t w) -> void {};
-
-	DFS dfs(visitStart, visitEnd, isVisited, visitPreRecursion, visitPostRecursion, visitAgain);
-	dfs(adj, mask);
-
-	//v_size_t vct = static_cast<v_size_t>(adj.size());
-	//// Whether each vertex has been visited.
-	//std::vector<mask_t> visited(vct, false);
-	//// List of components.
-	//std::vector<std::vector<v_size_t>> comps;
-	//v_size_t curIdx = 0;
-	//std::vector<v_size_t> dfsStack;
-	//
-	//for (v_size_t s = 0; s < vct; s++)
-	//{
-	//	// Skip visited vertices.
-	//	if (!mask[s] || visited[s]) continue;
-	//	std::vector<v_size_t> curComp;
-	//	dfsStack.push_back(s);
-	//	while (!dfsStack.empty())
-	//	{
-	//		// Pop v from the DFS stack.
-	//		v_size_t v = dfsStack.back();
-	//		dfsStack.pop_back();
-	//		// Skip visited vertices
-	//		if (visited[v]) continue;
-	//		visited[v] = true;
-	//		// Add v to the current component.
-	//		curComp.push_back(v);
-	//		// Push neighbors onto the dfs stack.
-	//		for (v_size_t w : adj[v])
-	//			if (mask[w])
-	//				dfsStack.push_back(w);
-	//	}
-	//	// Add the current component to the list.
-	//	comps.push_back(std::move(curComp));
-	//}
-	return comps;
+inline constexpr bool isSt(v_type_t vertType)
+{
+	return vertType != 0;
 }
 
-// Returns the biconnected components of the masked graph.
-inline std::vector<std::vector<v_size_t>> bicomponents(const std::vector<std::vector<v_size_t>>& adj, const std::vector<mask_t>& mask)
+inline constexpr bool isCrs(v_type_t vertType)
 {
-	v_size_t vct = adj.size();
-	v_size_t numI = 0;
-	std::vector<v_size_t> num(vct, 0);
-	std::vector<v_size_t> low(vct, 0);
-	std::vector<std::vector<v_size_t>> bicomps;
-	std::vector<std::pair<v_size_t, v_size_t>> edgeStack;
-	std::vector<mask_t> inBicomp(vct, false);
-
-	const auto visitStart = [&numI, &num, &low](v_size_t u, v_size_t v) -> void
-	{
-		low[v] = num[v] = ++numI;
-	};
-
-	const auto visitEnd = [](v_size_t u, v_size_t v) -> void {};
-
-	const auto isVisited = [&num](v_size_t w) -> bool
-	{
-		return num[w] != 0;
-	};
-
-	const auto visitPreRecursion = [&num, &edgeStack](v_size_t u, v_size_t v, v_size_t w) -> void
-	{
-		edgeStack.emplace_back(v, w);
-	};
-
-	const auto visitPostRecursion = [&num, &low, &bicomps, &edgeStack, &inBicomp](v_size_t u, v_size_t v, v_size_t w) -> void
-	{
-		low[v] = std::min(low[v], low[w]);
-		// If v is an articulation point, add a new biconnected component.
-		if (low[w] >= num[v])
-		{
-			std::vector<v_size_t> curBicomp;
-			std::pair<v_size_t, v_size_t> edge;
-
-			// For each edge on the stack until u-v, add it to the current bicomponent if not already added
-			// edge.first will be added as edge.second lower on the stack.
-			while (edge = edgeStack.back(), edgeStack.pop_back(), num[edge.first] >= num[w])
-				if (!inBicomp[edge.second])
-				{
-					curBicomp.push_back(edge.second);
-					inBicomp[edge.second] = true;
-				}
-
-			assert(edge == std::make_pair(v, w));
-
-			if (!inBicomp[edge.second])
-				curBicomp.push_back(edge.second);
-
-			if (!inBicomp[edge.first])
-				curBicomp.push_back(edge.first);
-
-			// Reset inBicomp for the next bicomponent.
-			for (v_size_t x : curBicomp)
-				inBicomp[x] = false;
-
-			// Add the current biconnected component to the list.
-			bicomps.emplace_back(std::move(curBicomp));
-		}
-	};
-
-	const auto visitAgain = [&num, &low, &edgeStack](v_size_t u, v_size_t v, v_size_t w) -> void
-	{
-		if (w == u || num[w] >= num[v]) return;
-		edgeStack.emplace_back(v, w);
-		low[v] = std::min(low[v], num[w]);
-	};
-
-	DFS dfs(visitStart, visitEnd, isVisited, visitPreRecursion, visitPostRecursion, visitAgain);
-	dfs(adj, mask);
-
-	//for (std::vector<v_size_t>& bicomp : bicomps) std::sort(bicomp.begin(), bicomp.end());
-	//std::sort(bicomps.begin(), bicomps.end(), [](const std::vector<v_size_t>& l, const std::vector<v_size_t>& r) { return r.size() < l.size(); });
-
-	return bicomps;
-
-	//BicomponentHelper helper(adj, mask);
-	//for (v_size_t s = 0; s < helper.vct; s++)
-	//	helper(s);
-	//return helper.bicomps;
+	return vertType == 0;
 }
 
-// See https://doi.ieeecomputersociety.org/10.1109/SocialCom-PASSAT.2012.66
-namespace betweenness_centrality
+inline constexpr v_type_t getMajor(v_type_t vertType)
 {
-	struct CompressedData
+	return vertType / 2;
+}
+
+inline constexpr bool isGrad(v_type_t vertType)
+{
+	return vertType & 1;
+}
+
+inline constexpr v_type_t getType(v_type_t major, bool grad)
+{
+	return major * 2 + grad;
+}
+
+void wcData(const char* location)
+{
+	std::ifstream fin(location);
+
+	std::string dummy;
+	if (!(fin >> dummy) || dummy != "WC")
 	{
-		// Number of equivalence classes
-		v_size_t vct;
-		// Equivalence classes are in [0, srcct) iff their vertices are in src.
-		v_size_t srcct;
-		// Compressed adjacency structure
-		std::vector<std::vector<v_size_t>> adj;
-		// Cardinality of eqch equivalence class
-		std::vector<v_size_t> mult;
-		// Vertex weight of each equivalence class
-		std::vector<weight_t> weights;
-		// Equivalence class of each vertex (or MAX<uli> for masked-out vertices)
-		std::vector<v_size_t> map;
-
-		inline CompressedData(v_size_t vct, v_size_t srcct, std::vector<std::vector<v_size_t>>&& adj, std::vector<weight_t>&& weights, std::vector<v_size_t>&& mult, std::vector<v_size_t>&& map) :
-			vct(vct),
-			srcct(srcct),
-			adj(adj),
-			weights(weights),
-			mult(mult),
-			map(map)
-		{}
-	};
-
-	// Removes masked-out vertices and converts the rest into an adjacency structure of structural equivalence classes.
-	// Runs in linearithmic time (negligible compared to Brandes' algorithm)
-	inline CompressedData compress(const std::vector<std::vector<v_size_t>>& adj, const std::vector<mask_t>& mask, const std::vector<mask_t>& src, const std::vector<weight_t>& weights)
-	{
-		v_size_t vct = static_cast<v_size_t>(adj.size());
-
-		// Masked adjacency structure
-		std::vector<std::vector<v_size_t>> madj(vct);
-		for (v_size_t v = 0; v < vct; v++)
-			if (mask[v])
-				for (v_size_t w : adj[v])
-					if (mask[w])
-						madj[v].push_back(w);
-
-		// List of vertices where masked-out vertices are at the end, vertices in src are at the beginning, and structural equivalence classes are contiguous.
-		std::vector<v_size_t> perm(vct);
-		std::iota(perm.begin(), perm.end(), 0);
-		std::sort(perm.begin(), perm.end(),
-			[&madj, &mask, &src, &weights](v_size_t l, v_size_t r) -> bool
-			{
-				// Masked-out vertices go to the end.
-				if (!mask[l]) return false;
-				if (!mask[r]) return true;
-				// Vertices in src go to the beginning.
-				if (src[l] != src[r]) return src[l] > src[r];
-				// Else sort by vertex weight
-				if (weights[l] != weights[r]) return weights[l] < weights[r];
-				// Else sort by masked degree
-				const std::vector<v_size_t>& lAdj = madj[l];
-				const std::vector<v_size_t>& rAdj = madj[r];
-				if (lAdj.size() != rAdj.size()) return lAdj.size() < rAdj.size();
-				// Else sort lexicographically by masked neighborhood.
-				return lAdj < rAdj;
-				// l and r are structurally equivalent iff every compared quality is the same, so at this point order does not matter.
-			});
-
-		// Stores each vertex's equivalence class
-		std::vector<v_size_t> map(vct, MAX<v_size_t>);
-		// Stores a representative vertex of each equivalence class
-		std::vector<v_size_t> reps;
-		std::vector<weight_t> cweights;
-		std::vector<v_size_t> mult;
-		reps.reserve(vct);
-		v_size_t csrcct = 0, p;
-		// Compute map, reps, cweights, mult, cvct, and srcct.
-		for (v_size_t i = 0; i < vct; i++)
-		{
-			v_size_t v = perm[i];
-			if (!mask[v]) break;
-			// If v starts a new equivalence class, increment counters
-			if (i == 0 || src[v] != src[p] || weights[v] != weights[p] || madj[v] != madj[p])
-			{
-				reps.push_back(v);
-				cweights.push_back(weights[v]);
-				mult.push_back(0);
-				csrcct += src[v];
-			}
-			v_size_t idx = static_cast<v_size_t>(reps.size()) - 1;
-			map[v] = idx;
-			mult[idx]++;
-			p = v;
-		}
-		// Number of equivalence classes
-		v_size_t cvct = static_cast<v_size_t>(reps.size());
-
-		// Adjacency structrue of equivalence classes
-		std::vector<std::vector<v_size_t>> cadj;
-		cadj.reserve(cvct);
-		for (v_size_t i = 0; i < cvct; i++)
-		{
-			v_size_t v = reps[i];
-			std::vector<v_size_t>& vAdj = madj[v];
-			// Map v's adjacency list
-			for (v_size_t& w : vAdj)
-				w = map[w];
-			// Sort v's adjacency list with masked-out vertices at the end
-			std::sort(vAdj.begin(), vAdj.end());
-			// Find the end of the masked-in vertices in vAdj
-			std::vector<v_size_t>::iterator last = vAdj.begin();
-			while (last != vAdj.end() && *last != MAX<v_size_t>)
-				last++;
-			// Remove duplicate equivalence classes from v's adjacency list
-			std::vector<v_size_t>::const_iterator clast = std::unique(vAdj.begin(), last);
-			// Add v's adjacency list to the fuly compressed adjacency structure
-			cadj.emplace_back(vAdj.cbegin(), clast);
-		}
-
-		return CompressedData(cvct, csrcct, std::move(cadj), std::move(cweights), std::move(mult), std::move(map));
+		std::cerr << "Cannot read input!";
+		std::exit(-1);
 	}
 
-	inline std::vector<weight_t> internal(const CompressedData& data)
-	{
-		std::vector<weight_t> bc(data.vct);
+	fin >> USTCT >> CRSCT;
+	UVCT = USTCT + CRSCT;
 
-		for (v_size_t v = 0; v < data.srcct; v++)
+	COSTS = std::vector<cost_t>(CRSCT);
+	CRSDEGS = std::vector<v_size_t>(CRSCT);
+
+	std::vector<std::vector<v_size_t>> stadj(USTCT), crsadj(CRSCT);
+	std::vector<v_type_t> sttp(USTCT);
+	std::vector<weight_t> crswt(CRSCT, 1);
+
+	// Read File Data
+	v_size_t stid, crsid, major, grad;
+	cost_t time;
+	v_size_t line = 2;
+	while (fin >> stid >> crsid >> major >> grad >> time)
+	{
+		stid--;
+		crsid--;
+		assert(stid < USTCT);
+		assert(crsid < CRSCT);
+		assert(major > 0 && major < 7);
+		assert(grad < 2);
+		sttp[stid] = getType(major, grad);
+		stadj[stid].push_back(crsid);
+		crsadj[crsid].push_back(stid);
+		crswt[crsid] = static_cast<weight_t>(1) / time;
+		COSTS[crsid] += time;
+		CRSDEGS[crsid]++;
+		line++;
+	}
+	fin.close();
+
+	// Combine Structurally Equivalent Vertices
+	for (v_size_t stid = 0; stid < USTCT; stid++)
+		std::sort(stadj[stid].begin(), stadj[stid].end());
+	for (v_size_t crsid = 0; crsid < CRSCT; crsid++)
+		std::sort(crsadj[crsid].begin(), crsadj[crsid].end());
+
+	static const auto stcmp = [&sttp, &stadj](v_size_t lstid, v_size_t rstid) -> bool
+	{
+		v_type_t ltp = sttp[lstid], rtp = sttp[rstid];
+		if (ltp != rtp)
+			return ltp < rtp;
+		const std::vector<v_size_t> &ladj = stadj[lstid], &radj = stadj[rstid];
+		if (ladj.size() != radj.size())
+			return ladj.size() < radj.size();
+		return std::lexicographical_compare(ladj.begin(), ladj.end(), radj.begin(), radj.end());
+	};
+
+	std::vector<v_size_t> stp = mkPerm(USTCT, stcmp);
+
+	STMAP = std::vector<v_size_t>(USTCT, 0);
+	STCT = 0;
+	for (v_size_t stidp = 1; stidp < USTCT; stidp++)
+	{
+		v_size_t prev = stp[stidp - 1], cur = stp[stidp];
+		bool equivalent = isGrad(sttp[prev]) == isGrad(sttp[cur]) && stadj[prev] == stadj[cur];
+		STMAP[cur] = STCT += !equivalent;
+	}
+	VCT = ++STCT + CRSCT;
+
+	ADJ = std::vector<std::vector<v_size_t>>(VCT);
+	MULT = std::vector<v_size_t>(VCT, 0);
+	TYPES = std::vector<v_type_t>(VCT, 0);
+	WEIGHTS = std::vector<weight_t>(VCT, 0);
+	MASK = std::vector<mask_t>(VCT, true);
+
+	std::vector<v_size_t> crsdeg(CRSCT, 0);
+	std::vector<mask_t> repeat(USTCT, 0);
+
+	for (v_size_t stid = 0; stid < USTCT; stid++)
+	{
+		v_size_t v = STMAP[stid];
+		assert(MULT[v] < std::numeric_limits<decltype(MULT)::value_type>::max());
+		if (repeat[stid] = MULT[v]++ != 0) continue;
+		std::vector<v_size_t>& adj = ADJ[v];
+		const std::vector<v_size_t>& uadj = stadj[stid];
+		v_size_t deg = static_cast<v_size_t>(uadj.size());
+		adj = std::vector<v_size_t>(deg);
+		for (v_size_t i = 0; i < deg; i++)
 		{
-			// Number of vertex pairs in v
-			e_size_t num = static_cast<e_size_t>(data.mult[v]) * (data.mult[v] - 1);
-			if (num == 0) continue;
-			// Number of shortest paths for each pair
-			v_size_t den = 0;
-			weight_t minWt = INF<weight_t>;
-			for (v_size_t w : data.adj[v])
+			v_size_t crsid = uadj[i];
+			adj[i] = crsid + STCT;
+			crsdeg[crsid]++;
+		}
+		TYPES[v] = sttp[stid];
+	}
+	for (v_size_t crsid = 0; crsid < CRSCT; crsid++)
+	{
+		v_size_t v = crsid + STCT;
+		MULT[v] = 1;
+		std::vector<v_size_t>& adj = ADJ[v];
+		const std::vector<v_size_t>& uadj = crsadj[crsid];
+		v_size_t deg = crsdeg[crsid], udeg = static_cast<v_size_t>(uadj.size());
+		adj = std::vector<v_size_t>();
+		adj.reserve(deg);
+		for (v_size_t i = 0; i < udeg; i++)
+		{
+			v_size_t stid = uadj[i];
+			if (repeat[stid]) continue;
+			adj.push_back(STMAP[stid]);
+		}
+		assert(adj.size() == deg);
+		WEIGHTS[v] = crswt[crsid];
+	}
+}
+
+// These are used for debugging
+
+void uncontractedData()
+{
+	STMAP = { 0, 1, 2 };
+	STCT = 3;
+	CRSCT = 2;
+	VCT = 5;
+	USTCT = 3;
+	UVCT = 5;
+	ADJ.resize(5);
+	ADJ[0] = { 3, 4 };
+	ADJ[1] = { 3 };
+	ADJ[2] = { 3, 4 };
+	ADJ[3] = { 0, 1, 2 };
+	ADJ[4] = { 0, 2 };
+	MULT = { 1, 1, 1, 1, 1 };
+	CRSDEGS = { 3, 2 };
+	TYPES = { 2, 5, 2, 0, 0 };
+	WEIGHTS = { 0, 0, 0, 1, 1 };
+	COSTS = { 3, 2 };
+	MASK = { true, true, true, true, true };
+}
+
+void unweightedData()
+{
+	STMAP = { 0, 1, 0 };
+	STCT = 2;
+	CRSCT = 2;
+	VCT = 4;
+	USTCT = 3;
+	UVCT = 5;
+	ADJ.resize(4);
+	ADJ[0] = { 2, 3 };
+	ADJ[1] = { 2 };
+	ADJ[2] = { 0, 1 };
+	ADJ[3] = { 0 };
+	MULT = { 2, 1, 1, 1 };
+	CRSDEGS = { 3, 2 };
+	TYPES = { 2, 5, 0, 0 };
+	WEIGHTS = { 0, 0, 1, 1 };
+	COSTS = { 3, 2 };
+	MASK = { true, true, true, true };
+}
+
+void weightedData()
+{
+	STMAP = { 0, 1, 0 };
+	STCT = 2;
+	CRSCT = 2;
+	VCT = 4;
+	USTCT = 3;
+	UVCT = 5;
+	ADJ.resize(4);
+	ADJ[0] = { 2, 3 };
+	ADJ[1] = { 2 };
+	ADJ[2] = { 0, 1 };
+	ADJ[3] = { 0 };
+	MULT = { 2, 1, 1, 1 };
+	CRSDEGS = { 3, 2 };
+	TYPES = { 2, 5, 0, 0 };
+	WEIGHTS = { 0, 0, 1, 0.5 };
+	COSTS = { 3, 4 };
+	MASK = { true, true, true, true };
+}
+
+const std::vector<cost_t> WC_MAXTC{ 0, 36081, 44442, 60766, 68474, 78458 };
+
+v_size_t incl()
+{
+	v_size_t ret = 0;
+	for (v_size_t v = 0; v < STCT; v++)
+	{
+		if (!MASK[v]) continue;
+		MASK[v] = false;
+		for (v_size_t w : ADJ[v])
+			if (MASK[w])
 			{
-				weight_t wt = data.weights[w];
+				MASK[v] = true;
+				ret += MULT[v];
+				break;
+			}
+	}
+	return ret;
+}
+
+v_size_t ccs()
+{
+	std::vector<v_size_t> ccidx(VCT, MAX<v_size_t>);
+	std::vector<v_size_t> ccsiz;
+	std::vector<v_size_t> stck;
+	for (v_size_t i = 0; i < VCT; i++)
+	{
+		if (!MASK[i] || ccidx[i] != MAX<v_size_t>) continue;
+		v_size_t idx = static_cast<v_size_t>(ccsiz.size());
+		stck.push_back(i);
+		ccsiz.push_back(0);
+		while (!stck.empty())
+		{
+			v_size_t v = stck.back();
+			stck.pop_back();
+			if (ccidx[v] != MAX<v_size_t>) continue;
+			ccidx[v] = idx;
+			if (v < STCT) ccsiz[idx] += MULT[v];
+			for (v_size_t w : ADJ[v])
+				if (MASK[w]) stck.push_back(w);
+		}
+	}
+	v_size_t num = static_cast<v_size_t>(ccsiz.size());
+	std::vector<v_size_t> perm = mkPerm(num, idx_cmp(ccsiz));
+	std::vector<v_size_t> inv(num);
+	for (v_size_t i = 0; i < num; i++)
+		inv[perm[i]] = i;
+	CCS = std::vector<std::vector<v_size_t>>(num);
+	for (v_size_t i = 0; i < VCT; i++)
+		if (MASK[i])
+			CCS[inv[ccidx[i]]].push_back(i);
+	CCSIZES = std::vector<v_size_t>(num);
+	for (v_size_t idx = 0; idx < num; idx++)
+	{
+		std::sort(CCS[idx].begin(), CCS[idx].end());
+		CCSIZES[idx] = ccsiz[perm[idx]];
+	}
+	return CCSIZES.empty() ? 0 : CCSIZES.back();
+}
+
+v_size_t bccs()
+{
+	typedef std::pair<v_size_t, v_size_t> Vert;
+	typedef std::pair<Vert, Vert> Edge;
+
+	struct Helper
+	{
+		v_size_t numI;
+		v_size_t bccIdx;
+		std::vector<std::vector<v_size_t>> num, low;
+		std::vector<Edge> stck;
+		std::vector<std::vector<Vert>> bicomps;
+		std::vector<v_size_t> bccsizes;
+
+		inline Helper() :
+			numI(0),
+			bccIdx(0),
+			num(VCT),
+			low(VCT)
+		{
+			for (v_size_t i = 0; i < VCT; i++)
+				if (MASK[i])
+				{
+					num[i].resize(MULT[i], 0);
+					low[i].resize(MULT[i], 0);
+				}
+		}
+
+		void operator()(Vert u, Vert v)
+		{
+			size_t uv = u.first, ui = u.second, vv = v.first, vi = v.second;
+			assert(num[vv][vi] == 0);
+			low[vv][vi] = num[vv][vi] = ++numI;
+			for (v_size_t wv : ADJ[vv])
+				if (MASK[wv])
+					for (v_size_t wi = 0; wi < MULT[wv]; wi++)
+					{
+						Vert w(wv, wi);
+						if (num[wv][wi] == 0)
+						{
+							stck.emplace_back(v, w);
+							// If stack overflow errors occur, increase call stack size. Infinite recursion should not be possible.
+							(*this)(v, w);
+							low[vv][vi] = std::min(low[vv][vi], low[wv][wi]);
+							if (low[wv][wi] >= num[vv][vi])
+							{
+								std::unordered_set<Vert> inBicomp;
+								std::vector<Vert> verts;
+								Vert u1, u2;
+								v_size_t size = 0;
+								while (std::tie(u1, u2) = stck.back(), stck.pop_back(), num[u1.first][u1.second] >= num[wv][wi])
+									if (inBicomp.insert(u2).second)
+									{
+										size += u2.first < STCT;
+										verts.push_back(u2);
+									}
+								assert(u1 == v && u2 == w);
+								if (inBicomp.insert(v).second)
+								{
+									size += vv < STCT;
+									verts.push_back(v);
+								}
+								if (inBicomp.insert(w).second)
+								{
+									size += wv < STCT;
+									verts.push_back(w);
+								}
+								std::sort(verts.begin(), verts.end(), pair_lex_cmp<v_size_t>());
+								bicomps.push_back(std::move(verts));
+								bccsizes.push_back(size);
+							}
+						}
+						else if (w != u && num[wv][wi] < num[vv][vi])
+						{
+							stck.emplace_back(v, w);
+							low[vv][vi] = std::min(low[vv][vi], num[wv][wi]);
+						}
+					}
+		}
+	} helper;
+
+	for (v_size_t i = 0; i < VCT; i++)
+		if (MASK[i])
+			for (v_size_t j = 0; j < MULT[i]; j++)
+				if (helper.num[i][j] == 0)
+					helper(Vert(0, 0), Vert(i, j));
+	assert(helper.stck.empty());
+	v_size_t num = static_cast<v_size_t>(helper.bicomps.size());
+	BCCS = std::vector<std::vector<Vert>>(num);
+	BCCSIZES = std::vector<v_size_t>(num);
+	std::vector<v_size_t> perm = mkPerm(num, idx_cmp(helper.bicomps, size_cmp()));
+	for (v_size_t i = 0; i < num; i++)
+	{
+		BCCS[i] = std::move(helper.bicomps[perm[i]]);
+		BCCSIZES[i] = helper.bccsizes[perm[i]];
+	}
+	return BCCSIZES.empty() ? 0 : BCCSIZES.back();
+}
+
+#if USE_GPU
+
+static_assert(false, "GPU not yet supported, #define USE_GPU to false.");
+
+#else
+
+struct BcHelper
+{
+	inline void operator()(std::atomic<v_size_t>* bcSPtr, std::mutex* bcMutexPtr, std::vector<mask_t> src, e_size_t maxQ) const
+	{
+		std::atomic<v_size_t>& bcS = *bcSPtr;
+		std::mutex& bcMutex = *bcMutexPtr;
+
+		e_size_t ect = 0;
+		//std::vector<std::pair<v_size_t, v_size_t*>> CADJ(VCT);
+		for (v_size_t v = 0; v < VCT; v++)
+		{
+			v_size_t deg = 0;
+			for (v_size_t w : ADJ[v])
+				deg += MASK[w];
+			//CADJ[v].first = deg;
+			ect += deg;
+		}
+		ect /= 2;
+		std::vector<v_size_t> CADJSP(ect * 2);
+
+		std::vector<v_size_t> PSP(ect * 2);
+		std::vector<v_size_t*> P(VCT);
+		{
+			v_size_t* pPtr = PSP.data();
+			//v_size_t* aPtr = CADJSP.data();
+			for (v_size_t i = 0; i < VCT; i++)
+				if (MASK[i])
+				{
+					//v_size_t deg = CADJ[i].first;
+					P[i] = pPtr;
+					//CADJ[i].second = aPtr;
+					//for (v_size_t w : ADJ[i])
+						//if (MASK[w]) *(aPtr++) = w;
+					//pPtr += deg;
+					for (v_size_t w : ADJ[i])
+						pPtr += MASK[w];
+				}
+			//assert(pPtr == &PSP.back() + 1);
+			//assert(aPtr == &CADJSP.back() + 1);
+		}
+
+		std::vector<v_size_t> S;
+		S.reserve(ect);
+		std::vector<weight_t> threadBC(VCT, 0);
+
+		std::vector<v_size_t> Ps(VCT, 0);
+		std::vector<weight_t> SP(VCT);
+		std::vector<weight_t> D(VCT);
+		std::vector<weight_t> DEP(VCT);
+		typedef std::pair<weight_t, v_size_t> Entry;
+		std::vector<Entry> Q(maxQ);
+		e_size_t Qs = 0;
+		v_size_t s;
+		for (s = bcS++; s < VCT; s = bcS++)
+		{
+#if DO_BC_PROG
+			if (s == 0 || (s - 1) * 100 / VCT < s * 100 / VCT)
+			{
+				bcMutex.lock();
+				std::cout << '\r' << s * 100 / VCT << '%' << std::flush;
+				bcMutex.unlock();
+			}
+#endif
+			if (!src[s]) continue;
+			assert(MULT[s]);
+			assert(S.empty());
+			std::fill(Ps.begin(), Ps.end(), 0);
+			std::fill(SP.begin(), SP.end(), static_cast<weight_t>(0));
+			SP[s] = static_cast<weight_t>(MULT[s]);
+			std::fill(D.begin(), D.end(), static_cast<weight_t>(-1));
+			D[s] = static_cast<weight_t>(0);
+			std::fill(DEP.begin(), DEP.end(), static_cast<weight_t>(0));
+			assert(Qs == 0);
+			Q[Qs++] = { static_cast<weight_t>(0), s };
+			while (Qs)
+			{
+				v_size_t v = Q[0].second;
+				e_size_t p = 0, c, l, r;
+				Entry x = Q[--Qs], ql, qr, qc;
+				for (; (l = p * 2 + 1) < Qs; p = c)
+				{
+					ql = Q[l];
+					r = l + 1;
+					bool goR = r < Qs && (qr = Q[r]).first < ql.first;
+					c = goR ? r : l;
+					qc = goR ? qr : ql;
+					if (qc.first >= x.first) break;
+					Q[p] = qc;
+				}
+				Q[p] = x;
+				S.push_back(v);
+				weight_t dv = D[v] + WEIGHTS[v];
+				//v_size_t adjS = static_cast<v_size_t>(ADJ[v].size());
+				//const std::pair<v_size_t, const v_size_t*> adj = CADJ[v];
+				const std::pair<v_size_t, const v_size_t*> adj = { ADJ[v].size(), &ADJ[v].front() };
+				//if (!adj.first) continue;
+				const v_size_t* wPtr = adj.second;
+				const v_size_t* end = wPtr + adj.first;
+				wPtr += 3;
+				for (; wPtr < end; wPtr += 4)
+				{
+					v_size_t w = *(wPtr - 3);
+					if (MASK[w])
+					{
+						weight_t dw = dv + WEIGHTS[w];
+						weight_t& dwr = D[w];
+						if (dwr < 0)
+						{
+							for (c = Qs++; c > 0 && dw < Q[p = (c - 1) / 2].first; c = p)
+								Q[c] = Q[p];
+							Q[c] = { dwr = dw, w };
+							SP[w] += SP[v] * MULT[w];
+							P[w][Ps[w]++] = v;
+						}
+						else if (dwr == dw)
+						{
+							SP[w] += SP[v] * MULT[w];
+							P[w][Ps[w]++] = v;
+						}
+					}
+					w = *(wPtr - 2);
+					if (MASK[w])
+					{
+						weight_t dw = dv + WEIGHTS[w];
+						weight_t& dwr = D[w];
+						if (dwr < 0)
+						{
+							for (c = Qs++; c > 0 && dw < Q[p = (c - 1) / 2].first; c = p)
+								Q[c] = Q[p];
+							Q[c] = { dwr = dw, w };
+							SP[w] += SP[v] * MULT[w];
+							P[w][Ps[w]++] = v;
+						}
+						else if (dwr == dw)
+						{
+							SP[w] += SP[v] * MULT[w];
+							P[w][Ps[w]++] = v;
+						}
+					}
+					w = *(wPtr - 1);
+					if (MASK[w])
+					{
+						weight_t dw = dv + WEIGHTS[w];
+						weight_t& dwr = D[w];
+						if (dwr < 0)
+						{
+							for (c = Qs++; c > 0 && dw < Q[p = (c - 1) / 2].first; c = p)
+								Q[c] = Q[p];
+							Q[c] = { dwr = dw, w };
+							SP[w] += SP[v] * MULT[w];
+							P[w][Ps[w]++] = v;
+						}
+						else if (dwr == dw)
+						{
+							SP[w] += SP[v] * MULT[w];
+							P[w][Ps[w]++] = v;
+						}
+					}
+					w = *wPtr;
+					if (MASK[w])
+					{
+						weight_t dw = dv + WEIGHTS[w];
+						weight_t& dwr = D[w];
+						if (dwr < 0)
+						{
+							for (c = Qs++; c > 0 && dw < Q[p = (c - 1) / 2].first; c = p)
+								Q[c] = Q[p];
+							Q[c] = { dwr = dw, w };
+							SP[w] += SP[v] * MULT[w];
+							P[w][Ps[w]++] = v;
+						}
+						else if (dwr == dw)
+						{
+							SP[w] += SP[v] * MULT[w];
+							P[w][Ps[w]++] = v;
+						}
+					}
+				}
+				v_size_t w;
+				// Fallthrough is intentional.
+				switch (adj.first % 4)
+				{
+				case 3:
+					w = *(wPtr - 1);
+					if (MASK[w])
+					{
+						weight_t dw = dv + WEIGHTS[w];
+						weight_t& dwr = D[w];
+						if (dwr < 0)
+						{
+							for (c = Qs++; c > 0 && dw < Q[p = (c - 1) / 2].first; c = p)
+								Q[c] = Q[p];
+							Q[c] = { dwr = dw, w };
+							SP[w] += SP[v] * MULT[w];
+							P[w][Ps[w]++] = v;
+						}
+						else if (dwr == dw)
+						{
+							SP[w] += SP[v] * MULT[w];
+							P[w][Ps[w]++] = v;
+						}
+					}
+				case 2:
+					w = *(wPtr - 2);
+					if (MASK[w])
+					{
+						weight_t dw = dv + WEIGHTS[w];
+						weight_t& dwr = D[w];
+						if (dwr < 0)
+						{
+							for (c = Qs++; c > 0 && dw < Q[p = (c - 1) / 2].first; c = p)
+								Q[c] = Q[p];
+							Q[c] = { dwr = dw, w };
+							SP[w] += SP[v] * MULT[w];
+							P[w][Ps[w]++] = v;
+						}
+						else if (dwr == dw)
+						{
+							SP[w] += SP[v] * MULT[w];
+							P[w][Ps[w]++] = v;
+						}
+					}
+				case 1:
+					w = *(wPtr - 3);
+					if (MASK[w])
+					{
+						weight_t dw = dv + WEIGHTS[w];
+						weight_t& dwr = D[w];
+						if (dwr < 0)
+						{
+							for (c = Qs++; c > 0 && dw < Q[p = (c - 1) / 2].first; c = p)
+								Q[c] = Q[p];
+							Q[c] = { dwr = dw, w };
+							SP[w] += SP[v] * MULT[w];
+							P[w][Ps[w]++] = v;
+						}
+						else if (dwr == dw)
+						{
+							SP[w] += SP[v] * MULT[w];
+							P[w][Ps[w]++] = v;
+						}
+					}
+				}
+			}
+			while (!S.empty())
+			{
+				v_size_t w = S.back();
+				S.pop_back();
+				weight_t f = (src[w] ? MULT[w] + DEP[w] : DEP[w]) * MULT[w] / SP[w];
+				for (v_size_t i = 0, v; i < Ps[w]; i++)
+					v = P[w][i], DEP[v] += SP[v] * f;
+				if (w != s)
+					threadBC[w] += DEP[w] * MULT[s];
+			}
+		}
+#if DO_BC_PROG
+		if (s == VCT)
+		{
+			bcMutex.lock();
+			std::cout << '\r' << std::flush;
+			bcMutex.unlock();
+		}
+#endif
+		bcMutex.lock();
+		for (v_size_t i = 0; i < VCT; i++)
+			if (MASK[i])
+				BC[i] += threadBC[i] / MULT[i];
+		bcMutex.unlock();
+	}
+};
+
+// norm == 0: No normalization
+// norm == 1: (n-2)(n-1)/2 normalization
+// norm == 2: n(n-1)/2 normalization
+inline weight_t bc(const std::vector<mask_t>& srcIn, v_type_t norm)
+{
+	assert(norm < 3);
+	BC = std::vector<weight_t>(VCT, 0);
+	std::atomic<v_size_t> bcS = 0;
+	std::mutex bcMutex;
+	// TODO measure exactly
+	//v_size_t maxD = 0;
+	//for (const std::vector<v_size_t>& adj : ADJ)
+	//	maxD = std::max(maxD, static_cast<v_size_t>(adj.size()));
+	e_size_t maxQ = 50000;
+	maxQ = maxQ / 2 + 1;
+	std::vector<mask_t> SRC(VCT);
+	for (v_size_t i = 0; i < VCT; i++)
+		SRC[i] = srcIn[i] & MASK[i];
+
+	// Add paths between structurally equivalent pairs of vertices
+	for (v_size_t v = 0; v < VCT; v++)
+		if (SRC[v] && MULT[v] > 1)
+		{
+			e_size_t n = MULT[v];
+			n = n * (n - 1);
+			v_size_t d = 0;
+			weight_t minWt = std::numeric_limits<weight_t>::infinity();
+			for (v_size_t w : ADJ[v])
+			{
+				if (!MASK[w]) continue;
+				weight_t wt = WEIGHTS[w];
 				if (wt < minWt)
 				{
+					d = MULT[w];
 					minWt = wt;
-					den = data.mult[w];
 				}
 				else if (wt == minWt)
-					den += data.mult[w];
+					d += MULT[w];
 			}
-			// Sum over all pairs of vertices in v of the dependency on any one vertex in w.
-			weight_t dep = num / static_cast<weight_t>(den);
-			for (v_size_t w : data.adj[v])
-				bc[w] += dep;
+			weight_t dbc = static_cast<weight_t>(n) / d;
+			for (v_size_t w : ADJ[v])
+				if (MASK[w] && WEIGHTS[w] == minWt) BC[w] += dbc;
 		}
 
-		return bc;
-	}
+	std::vector<std::thread> threads;
+	for (v_size_t th = 0; th < NUM_THREADS; th++)
+		threads.emplace_back(BcHelper(), &bcS, &bcMutex, SRC, maxQ);
+	for (std::thread& thread : threads)
+		thread.join();
 
-	inline std::vector<weight_t> external(const CompressedData& data)
-	{
-		// Compute the block-cut tree
-		std::vector<std::vector<v_size_t>> bicomps = bicomponents(data.adj, std::vector<mask_t>(data.vct, true));
-		v_size_t maxs = 0;
-		for (const std::vector<v_size_t>& bicomp : bicomps)
-			maxs = std::max(maxs, static_cast<v_size_t>(bicomp.size()));
+	v_size_t n = 0;
+	for (v_size_t v = 0; v < VCT; v++)
+		if (MASK[v]) n += MULT[v];
 
-		std::vector<v_size_t> artPts;
-		artPts.reserve(bicomps.size() - 1);
-		std::vector<std::vector<v_size_t>> bicompMap(data.vct);
-		for (v_size_t i = 0; i < bicomps.size(); i++)
-			for (v_size_t v : bicomps[i])
-			{
-				if (bicompMap[v].size() == 1)
-					artPts.push_back(v);
-				bicompMap[v].push_back(i);
-			}
+	weight_t maxBC = 0;
+	weight_t f =
+		norm == 0 ? static_cast<weight_t>(0.5) :
+		norm == 1 ? 1 / (static_cast<weight_t>(n - 2) * (n - 1)) :
+		1 / (static_cast<weight_t>(n) * (n - 1));
+	for (v_size_t v = 0; v < VCT; v++)
+		if (MASK[v])
+			maxBC = std::max(maxBC, BC[v] *= f);
+	return maxBC;
+}
+#endif
 
-		// TODO temporary
-		return std::vector<weight_t>();
-	}
-
-	inline std::vector<weight_t> compute(const std::vector<std::vector<v_size_t>>& adj, const std::vector<mask_t>& mask, const std::vector<mask_t>& src, const std::vector<weight_t>& weights)
-	{
-		CompressedData data = compress(adj, mask, src, weights);
-
-		std::vector<weight_t> in = internal(data);
-		std::vector<weight_t> ex = external(data);
-
-		//for (v_size_t v = 0; v < data.vct; v++)
-		//	in[v] += ex[v];
-		return in;
-	}
+template<unsigned int P, unsigned int W, bool I>
+struct Format {};
+template<unsigned int P, unsigned int W, bool I>
+inline std::ostream& operator<<(std::ostream& strm, const Format<P, W, I>&)
+{
+	if (!I) strm << ' ';
+	return strm << std::fixed << std::setprecision(P) << std::setw(W);
 }
 
-struct GraphData
+void analyze(unsigned int tc)
 {
-	v_size_t stct;
-	v_size_t crsct;
-	v_size_t vct;
-	std::vector<std::vector<v_size_t>> adj;
-	std::vector<cost_t> costs;
-	std::vector<weight_t> weights;
-	std::vector<mask_t> stMask;
-	std::string name;
+	const static Format<6, 6, true> ifmt;
+	const static Format<1, 5, false> fmt;
+	const static Format<5, 7, false> bfmt;
 
-	inline GraphData(v_size_t stct, v_size_t crsct, std::string&& name) :
-		stct(stct),
-		crsct(crsct),
-		vct(stct + crsct),
-		adj(vct),
-		costs(vct),
-		weights(vct),
-		stMask(vct, false),
-		name(name)
-	{
-		std::fill_n(stMask.begin(), stct, true);
-	}
-
-	inline GraphData(v_size_t stct, v_size_t crsct, const std::string& name) :
-		GraphData(stct, crsct, std::move(std::string(name)))
-	{}
-};
-
-//template<typename T = double>
-struct Percent
-{
-	double val;
-
-	explicit inline Percent(double prop) :
-		val(prop * 100)
-	{}
-
-	inline Percent(double num, double den) :
-		val(num * 100 / den)
-	{}
-
-	friend inline std::ostream& operator<<(std::ostream& strm, const Percent& pc)
-	{
-		return strm << pc.val << '%';
-	}
-};
-
-inline void analyze(cost_t totalCost, const GraphData& data, const std::vector<mask_t>& mask)
-{
-	std::vector<v_size_t> non0degs = non0degrees(data.adj, mask);
-	assert(!non0degs.empty());
-	v_size_t non0ct = maskedCount(non0degs, data.stMask);
-	Percent inclPc(non0ct, data.stct);
-
-	std::vector<std::vector<v_size_t>> comps = components(data.adj, mask);
-	assert(!comps.empty());
-	v_size_t maxCompSize = maxMaskedCount(comps, data.stMask).first;
-	Percent maxCompPc(maxCompSize, data.stct);
-
-	std::vector<std::vector<v_size_t>> bicomps = bicomponents(data.adj, mask);
-	assert(!bicomps.empty());
-	v_size_t maxBicompSize = maxMaskedCount(bicomps, data.stMask).first;
-	Percent maxBicompPc(maxBicompSize, data.stct);
-	v_size_t maxBicompIncCrs = 0;
-	for (const std::vector<v_size_t>& bicomp : bicomps)
-		maxBicompIncCrs = std::max(maxBicompIncCrs, static_cast<v_size_t>(bicomp.size()));
-
-	betweenness_centrality::compute(data.adj, mask, std::vector<mask_t>(data.vct, true), data.weights);
+	weight_t f = static_cast<weight_t>(100) / USTCT;
+	v_size_t inclSt = incl();
+	v_size_t maxCC = ccs();
+	v_size_t maxBCC = bccs();
+#if DO_BC
+#if TIME_BC
+	typedef std::chrono::high_resolution_clock Clock;
+	typedef Clock::time_point Time;
+	Time start = Clock::now();
+#endif
+	std::vector<mask_t> src(VCT, false);
+	for (v_size_t v : CCS.back())
+		src[v] = true;
+	weight_t maxBC = bc(src, 1);
+#if TIME_BC
+	Time end = Clock::now();
+	std::cout
+		<< std::chrono::duration_cast<std::chrono::seconds>(end - start).count() << "s "
+		<< std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() % 1000 << "ms" << std::endl;
+#endif
+#endif
+	weight_t inclStd = inclSt * f;
+	weight_t maxCCd = maxCC * f;
+	weight_t maxBCCd = maxBCC * f;
 
 	std::cout
-		<< std::setw(6) << totalCost
-		<< std::setw(6) << data.stct
-		<< std::setw(6) << non0ct
-		<< std::setw(6) << maxCompSize
-		<< std::setw(6) << maxBicompSize
-		<< std::setw(6) << std::accumulate(mask.cbegin(), mask.cend(), 0)
+		<< ifmt << tc
+#if PERCENT
+		<< fmt << inclStd << '%'
+		<< fmt << maxCCd << '%'
+		<< fmt << maxBCCd << '%'
+#else
+		<< fmt << inclSt
+		<< fmt << maxCC
+		<< fmt << maxBCC
+#endif
+#if DO_BC
+		<< bfmt << maxBC
+#endif
 		<< std::endl;
-
-
-	std::cout
-		<< std::setw(6) << totalCost
-		<< ' ' << std::fixed << std::setprecision(3) << std::setw(7) << inclPc
-		<< ' ' << std::fixed << std::setprecision(3) << std::setw(7) << maxCompPc
-		<< ' ' << std::fixed << std::setprecision(3) << std::setw(7) << maxBicompPc
-		<< std::endl;
-
 }
 
-inline void testWCStrategy(const GraphData& data, const std::vector<cost_t> maxCosts)
+void testWC(const std::string& name)
 {
-	// Courses in descending order of student count.
-	std::vector<v_size_t> courses(data.crsct);
-	std::iota(courses.begin(), courses.end(), data.stct);
-	std::sort(courses.begin(), courses.end(),
-		[&data](v_size_t l, v_size_t r) -> bool
+	std::cout << std::endl << std::endl << name << std::endl;
+	std::vector<v_size_t> perm = mkPerm(CRSCT, idx_cmp(CRSDEGS, std::greater<size_t>()));
+	v_size_t idx = 0;
+	cost_t tc = 0;
+	for (cost_t maxTC : WC_MAXTC)
+	{
+		while (idx < CRSCT)
 		{
-			return data.adj[l].size() > data.adj[r].size();
+			v_size_t crsid = perm[idx];
+			v_size_t v = crsid + STCT;
+			if (!MASK[v]) continue;
+			cost_t newTC = tc + COSTS[crsid];
+			if (newTC > maxTC) break;
+			MASK[v] = false;
+			tc = newTC;
+			idx++;
 		}
-	);
-
-	for (cost_t maxCost : maxCosts)
-	{
-		std::vector<mask_t> mask(data.vct, true);
-		cost_t totalCost = 0;
-		for (v_size_t v : courses)
-		{
-			cost_t newTC = totalCost + data.costs[v];
-			if (newTC <= maxCost)
-			{
-				mask[v] = false;
-				totalCost = newTC;
-			}
-		}
-		analyze(totalCost, data, mask);
+		analyze(tc);
 	}
-}
-
-inline GraphData readWC(std::istream& strm)
-{
-	std::string name;
-	std::getline(strm, name);
-
-	typedef std::unordered_map<input_t, v_size_t> IdMap;
-	IdMap stMap, crsMap;
-
-	input_t stId, crsId;
-
-	std::vector<std::pair<v_size_t, v_size_t>> edges;
-	while (strm >> stId >> crsId)
-	{
-		IdMap::iterator stIter = stMap.try_emplace(stId, static_cast<v_size_t>(stMap.size())).first;
-		IdMap::iterator crsIter = crsMap.try_emplace(crsId, static_cast<v_size_t>(crsMap.size())).first;
-		edges.emplace_back(stIter->second, crsIter->second);
-	}
-
-	GraphData data(static_cast<v_size_t>(stMap.size()), static_cast<v_size_t>(crsMap.size()), std::move(name));
-
-	for (const std::pair<v_size_t, v_size_t>& edge : edges)
-	{
-		v_size_t v = edge.first, w = edge.second + data.stct;
-		data.adj[v].push_back(w);
-		data.adj[w].push_back(v);
-	}
-
-	// Needed for identifying structurally equivalent vertices
-	for (std::vector<v_size_t>& vAdj : data.adj)
-		std::sort(vAdj.begin(), vAdj.end());
-
-	std::fill_n(data.costs.begin(), data.stct, MAX<cost_t>);
-	for (v_size_t v = data.stct; v < data.vct; v++)
-		data.costs[v] = static_cast<cost_t>(data.adj[v].size());
-
-	std::fill_n(data.weights.begin(), data.stct, static_cast<weight_t>(0));
-	std::fill_n(data.weights.begin() + data.stct, data.crsct, static_cast<weight_t>(1));
-
-	return data;
-}
-
-inline GraphData fileData(const char* filename)
-{
-	std::ifstream strm(filename);
-	std::string fmt;
-	std::getline(strm, fmt);
-	if (fmt == "WC")
-		return readWC(strm);
-	else
-	{
-		std::cerr << "Unknown File Format \"" << fmt << '\"' << std::endl;
-		exit(-1);
-	}
-}
-
-inline void test(const GraphData& data, const std::vector<cost_t>& maxCosts)
-{
-	std::cout << std::string(32, '-') << std::endl << data.name << std::endl;
-	std::cout << std::endl << "Weeden/Cornwell Strategy" << std::endl;
-	testWCStrategy(data, maxCosts);
-}
-
-inline std::vector<cost_t> sizeThresholdMaxCosts(const GraphData& data, const std::vector<v_size_t>& sizes)
-{
-	v_size_t numThresholds = static_cast<v_size_t>(sizes.size());
-	std::vector<cost_t> maxCosts(numThresholds, 0);
-	for (v_size_t i = 0; i < numThresholds; i++)
-		for (v_size_t v = data.stct; v < data.vct; v++)
-			if (data.adj[v].size() >= sizes[i])
-				maxCosts[i] += data.costs[v];
-	return maxCosts;
 }
 
 int main(int argc, const char* argv[])
 {
-	const std::vector<v_size_t> sizes{ MAX<v_size_t>, 100, 75, 50, 40, 30 };
-	for (int i = 1; i < argc; i++)
+	if (argc != 2)
 	{
-		GraphData data = fileData(argv[i]);
-		std::vector<cost_t> maxCosts = sizeThresholdMaxCosts(data, sizes);
-		test(data, maxCosts);
+		std::cerr << "Pass the input file as the first and only argument." << std::endl;
+		std::exit(-1);
 	}
+	wcData(argv[1]);
+	testWC("UNIVERSITY");
+	std::cout << std::endl;
+	return 0;
 }
-
-
-//struct BicomponentHelper
-//{
-//	const v_size_t vct;
-//	const std::vector<std::vector<v_size_t>>& adj;
-//	const std::vector<mask_t>& mask;
-//
-//	v_size_t numI = 0;
-//	// Index (starting at 1) of each vertex in the DFS forest.
-//	std::vector<v_size_t> num;
-//	// Low-point of each vertex in the DFS palm forest.
-//	std::vector<v_size_t> low;
-//	// List of bicomponents.
-//	std::vector<std::vector<v_size_t>> bicomps;
-//	std::vector<std::pair<v_size_t, v_size_t>> edgeStack;
-//	std::vector<mask_t> inBicomp;
-//
-//	inline BicomponentHelper(const std::vector<std::vector<v_size_t>>& adj, const std::vector<mask_t>& mask) :
-//		vct(static_cast<v_size_t>(adj.size())),
-//		adj(adj),
-//		mask(mask),
-//		num(vct, 0),
-//		low(vct, 0),
-//		inBicomp(vct, false)
-//	{}
-//
-//	inline void biconnect(v_size_t u, v_size_t v)
-//	{
-//		// Number vertices, starting at 1.
-//		low[v] = num[v] = ++numI;
-//		for (v_size_t w : adj[v])
-//		{
-//			if (!mask[w]) continue;
-//			// Recurse on unvisited vertices.
-//			if (num[w] == 0)
-//			{
-//				edgeStack.emplace_back(v, w);
-//				// Stack overflow errors are possible here; simply increase stack size until this is no longer an issue.
-//				biconnect(v, w);
-//
-//				low[v] = std::min(low[v], low[w]);
-//				// If v is an articulation point, add a new biconnected component.
-//				if (low[w] >= num[v])
-//				{
-//					std::vector<v_size_t> curBicomp;
-//					std::pair<v_size_t, v_size_t> edge;
-//
-//					// For each edge on the stack until u-v, add it to the current bicomponent if not already added
-//					// edge.first will be added as edge.second lower on the stack.
-//					while (edge = edgeStack.back(), edgeStack.pop_back(), num[edge.first] >= num[w])
-//						if (!inBicomp[edge.second])
-//						{
-//							curBicomp.push_back(edge.second);
-//							inBicomp[edge.second] = true;
-//						}
-//
-//					assert(edge == std::make_pair(v, w));
-//
-//					if (!inBicomp[edge.second])
-//						curBicomp.push_back(edge.second);
-//
-//					if (!inBicomp[edge.first])
-//						curBicomp.push_back(edge.first);
-//
-//					// Reset inBicomp for the next bicomponent.
-//					for (v_size_t x : curBicomp)
-//						inBicomp[x] = false;
-//
-//					// Add the current biconnected component to the list.
-//					bicomps.emplace_back(std::move(curBicomp));
-//				}
-//			}
-//			// Update v's low-point if adjacent to a lower vertex (besides its parent).
-//			else if (w != u && num[w] < num[v])
-//			{
-//				edgeStack.emplace_back(v, w);
-//				low[v] = std::min(low[v], num[w]);
-//			}
-//		}
-//	}
-//
-//	inline void operator()(v_size_t s)
-//	{
-//		if (mask[s] && num[s] == 0)
-//			biconnect(0, s);
-//	}
-//};

@@ -18,13 +18,13 @@
 
 #define USE_GPU false
 
-#define DO_BC false
+#define DO_BC true
 #define TIME_BC true
 #define DO_BC_PROG true
 #define NUM_THREADS 12
 
-template<typename T>
-constexpr T MAX = std::numeric_limits<T>::max();
+//template<typename T>
+//constexpr T MAX = std::numeric_limits<T>::max();
 
 // Maps students to contracted vertices
 std::vector<v_size_t> STMAP;
@@ -958,7 +958,12 @@ void setUndergradMask()
 
 int main(int argc, const char* argv[])
 {
-	wcData("Cornell.txt");
+	if (argc < 2)
+	{
+		std::cerr << "Pass the input file as the first argument." << std::endl;
+		std::exit(-1);
+	}
+	wcData(argv[0]);
 	//uncontractedData();
 	//unweightedData();
 	//weightedData();
